@@ -3,12 +3,11 @@ info:
   description: L25GC+ UPF-U Configuration
 
 configuration:
-  log_level: "warning"  # trace, debug, info, warning, error, fatal, panic
+  log_level: "warning"
   dataplane:
-    # Logical N3 carried over the N3IWF-DP/UPF-U ONVM ring.
+    # Same-server N3IWF test: N3 is logical over ONVM rings.
     upf_n3_ip: "192.168.4.2"
-    # Physical N6 owned by UPF-U on mlx5 DPDK port 0.
-    upf_n6_ip: "192.168.3.1"
+    upf_n6_ip: "192.168.50.1"
 
     ports:
       n3_port: 1
@@ -19,18 +18,9 @@ configuration:
       peer_n3_ip: "192.168.4.1"
       service_id: 14
 
-    # NR-DC downlink per-flow ECMP (optional). Presence of dc_gnb_ip enables
-    # DL path selection between the master and secondary gNB N3 endpoints.
-    # Next-hop MACs are resolved by ARP; no MAC configuration is needed.
-    # Enable only after the single-gNB (master) data plane is validated.
-    # nrdc:
-    #   dc_gnb_ip: "192.168.6.3"     # secondary gNB N3 IP
+    # NR-DC DL per-flow ECMP: secondary leg = in-core N3IWF N3
+    nrdc:
+      dc_gnb_ip: "192.168.4.1"
 
-  # NAT configuration (optional; incompatible with nrdc — NAT pins the N3 next hop)
   nat:
-    enable: false # true/false or 1/0
-    an_peer_n3_ip: "192.168.4.1"
-    dn_peer_n6_ip: "192.168.3.2"
-    public_ip: "192.168.3.1"
-    port_min: 10000
-    port_max: 60000
+    enable: false
