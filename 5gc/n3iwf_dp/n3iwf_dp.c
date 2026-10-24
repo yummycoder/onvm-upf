@@ -9,6 +9,12 @@
  */
 
 #include "n3iwf_dp_clear.h"
+#include <netinet/in.h>
+#include <rte_udp.h>
+#include <rte_ip.h>
+#include <rte_byteorder.h>
+#include <rte_ether.h>
+#include <time.h>
 #include "n3iwf_dp_control.h"
 #include "n3iwf_dp_ipsec.h"
 #include "n3iwf_dp_punt.h"
@@ -186,6 +192,35 @@ packet_handler(struct rte_mbuf *packet, struct onvm_pkt_meta *meta,
         /* IKE and the signalling Child SA remain on the temporary kernel
          * boundary. Only packets not owned by a programmed user-plane SA
          * are eligible for that punt. */
+        /* Relay ARP on the access port to the UPF regardless of the strict
+         * CP punt classifier, so the UPF's N3 neigh table can learn replies
+         * for physical next-hops (MN gNB) that share this port. */
+        if (packet->port == state->access_port && state->upf_service_id != 0) {
+            struct rte_ether_hdr *eh =
+                rte_pktmbuf_mtod(packet, struct rte_ether_hdr *);
+            uint16_t et = rte_be_to_cpu_16(eh->ether_type);
+            bool relay_to_upf = (et == RTE_ETHER_TYPE_ARP);
+            if (!relay_to_upf && et == RTE_ETHER_TYPE_IPV4 &&
+                rte_pktmbuf_pkt_len(packet) >= sizeof(*eh) +
+                    sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_udp_hdr)) {
+                struct rte_ipv4_hdr *ip4 = (struct rte_ipv4_hdr *)(eh + 1);
+                if (ip4->next_proto_id == IPPROTO_UDP) {
+                    struct rte_udp_hdr *udp = (struct rte_udp_hdr *)
+                        ((uint8_t *)ip4 + (size_t)(ip4->version_ihl & 0x0f) * 4U);
+                    if (rte_be_to_cpu_16(udp->dst_port) == 2152U) {
+                        relay_to_upf = true;   /* UL GTP-U for the UPF */
+                    }
+                }
+            }
+            if (relay_to_upf) {
+                if (et == RTE_ETHER_TYPE_ARP) {
+                    (void)punt_packet_to_cp(packet, state);  /* kernel still gets ARP */
+                }
+                meta->destination = state->upf_service_id;
+                meta->action = ONVM_NF_ACTION_TONF;
+                return 0;
+            }
+        }
         if (punt_packet_to_cp(packet, state) != N3IWF_DP_PUNT_NONE) {
             return 0;
         }
@@ -270,6 +305,104 @@ return_control_packets(struct onvm_nf_local_ctx *local_context,
     }
 }
 
+static bool
+resolve_access_gateway_mac(const char *ifname, const char *own_ipv4,
+                           uint8_t mac_out[N3IWF_DP_ETHER_ADDR_LEN])
+{
+    char line[256];
+    char prefix[INET_ADDRSTRLEN];
+    char *dot;
+    FILE *fp;
+    bool found = false;
+
+    snprintf(prefix, sizeof(prefix), "%s", own_ipv4);
+    dot = strrchr(prefix, '.');
+    if (dot == NULL) {
+        return false;
+    }
+    dot[1] = '\0';                      /* "192.168.30." */
+
+    fp = fopen("/proc/net/arp", "re");
+    if (fp == NULL) {
+        return false;
+    }
+    if (fgets(line, sizeof(line), fp) == NULL) {   /* header */
+        fclose(fp);
+        return false;
+    }
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        char ip[64], hwtype[16], flags[16], mac[64], mask[64], dev[64];
+        unsigned int m[6];
+
+        if (sscanf(line, "%63s %15s %15s %63s %63s %63s",
+                   ip, hwtype, flags, mac, mask, dev) != 6) {
+            continue;
+        }
+        if (strcmp(dev, ifname) != 0) {
+            continue;
+        }
+        if (strtoul(flags, NULL, 16) == 0) {           /* has a cached lladdr */
+            continue;
+        }
+        if (strncmp(ip, prefix, strlen(prefix)) != 0) {/* same /24 as our NWu */
+            continue;
+        }
+        if (strcmp(ip, own_ipv4) == 0) {               /* skip ourselves */
+            continue;
+        }
+        if (sscanf(mac, "%x:%x:%x:%x:%x:%x",
+                   &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != 6) {
+            continue;
+        }
+        for (int i = 0; i < N3IWF_DP_ETHER_ADDR_LEN; ++i) {
+            mac_out[i] = (uint8_t)m[i];
+        }
+        found = true;
+        break;
+    }
+    fclose(fp);
+    return found;
+}
+
+static void
+reconcile_access_macs(struct n3iwf_dp_state *state)
+{
+    static time_t last_scan;
+    time_t now;
+    uint8_t mac[N3IWF_DP_ETHER_ADDR_LEN];
+    bool resolved = false, have_mac = false;
+    size_t i;
+
+    if (state->punt_ifname[0] == '\0' || state->nwu_ipv4[0] == '\0') {
+        return;
+    }
+    now = time(NULL);
+    if (now == last_scan) {
+        return;
+    }
+    last_scan = now;
+
+    for (i = 0; i < N3IWF_DP_MAX_SESSIONS; ++i) {
+        struct n3iwf_dp_session *session = &state->sessions.entries[i];
+
+        if (!session->used || session->ue_access_mac_valid) {
+            continue;
+        }
+        if (!resolved) {
+            have_mac = resolve_access_gateway_mac(state->punt_ifname,
+                                                  state->nwu_ipv4, mac);
+            resolved = true;
+        }
+        if (!have_mac) {
+            break;
+        }
+        if (n3iwf_dp_session_learn_access_mac(session, mac) ==
+            N3IWF_DP_MAC_LEARNED) {
+            ++state->stats.access_mac_learns;
+        }
+    }
+}
+
 static int
 periodic_action(struct onvm_nf_local_ctx *local_context)
 {
@@ -279,6 +412,7 @@ periodic_action(struct onvm_nf_local_ctx *local_context)
     if (state->software_ipsec) {
         n3iwf_dp_ipsec_reconcile(&state->ipsec, &state->child_sas);
     }
+    reconcile_access_macs(state);
     return_control_packets(local_context, state);
     return 0;
 }
