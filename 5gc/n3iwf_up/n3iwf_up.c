@@ -8,48 +8,54 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "n3iwf_dp_clear.h"
+#include "n3iwf_up_clear.h"
+#include "n3iwf_up_control.h"
+#include "n3iwf_up_ipsec.h"
+#include "n3iwf_up_punt.h"
+#include "n3iwf_up_session.h"
 #include <netinet/in.h>
 #include <rte_udp.h>
 #include <rte_ip.h>
 #include <rte_byteorder.h>
 #include <rte_ether.h>
 #include <time.h>
-#include "n3iwf_dp_control.h"
-#include "n3iwf_dp_ipsec.h"
-#include "n3iwf_dp_punt.h"
-#include "n3iwf_dp_session.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include <rte_cycles.h>
+#include <rte_ethdev.h>
 #include <rte_malloc.h>
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
-#include <rte_ethdev.h>
 
 #include "onvm_nflib.h"
 
-#define NF_TAG "n3iwf_dp"
-#define DEFAULT_CONTROL_SOCKET "/run/l25gc/n3iwf-dp.sock"
+#define NF_TAG "n3iwf_up"
+#define DEFAULT_CONTROL_NAME N3DP_DEFAULT_CONTROL_NAME
 #define DEFAULT_UPF_SERVICE_ID 1U
 #define DEFAULT_ACCESS_PORT 0U
 #define CONTROL_FRAME_CAPACITY 4096U
 #define CONTROL_RX_BURST 32U
+#define AUX_POLL_INTERVAL_US 100U
+#define PROFILE_REPORT_INTERVAL_SECONDS 5U
 
-struct n3iwf_dp_state {
-    struct n3iwf_dp_session_table sessions;
-    struct n3iwf_dp_child_sa_table child_sas;
-    struct n3iwf_dp_control control;
-    struct n3iwf_dp_punt punt;
-    struct n3iwf_dp_ipsec ipsec;
-    struct n3iwf_dp_stats_wire stats;
+struct n3iwf_up_state {
+    struct n3iwf_up_session_table sessions;
+    struct n3iwf_up_child_sa_table child_sas;
+    struct n3iwf_up_control control;
+    struct n3iwf_up_punt punt;
+    struct n3iwf_up_ipsec ipsec;
+    struct n3iwf_up_stats_wire stats;
+    struct n3iwf_up_cycle_profile cycle_profile;
+    struct n3iwf_up_cycle_profile last_cycle_profile;
     struct rte_mempool *pktmbuf_pool;
     uint16_t upf_service_id;
     uint16_t access_port;
@@ -57,37 +63,43 @@ struct n3iwf_dp_state {
     bool software_ipsec;
     bool punt_enabled;
     bool allow_kernel_signalling_esp;
-    char control_socket[108];
+    bool cycle_profile_enabled;
+    uint64_t last_aux_poll_cycles;
+    uint64_t aux_poll_interval_cycles;
+    uint64_t last_profile_report_cycles;
+    uint64_t profile_report_interval_cycles;
+    char control_name[21];
     char punt_ifname[IF_NAMESIZE];
     char nwu_ipv4[INET_ADDRSTRLEN];
-    uint8_t access_mac[N3IWF_DP_ETHER_ADDR_LEN];
+    uint8_t access_mac[N3IWF_UP_ETHER_ADDR_LEN];
 };
 
 static void
 usage(const char *program)
 {
     printf("Usage: %s [DPDK args] -- [ONVM args] -- "
-           "[-c socket] [-s upf-service] [-a access-port] "
-           "[-p tap -i NWu-IPv4] [-k] [-t|-e]\n", program);
+           "[-c control-name] [-s upf-service] [-a access-port] "
+           "[-p tap -i NWu-IPv4] [-k] [-d] [-t|-e]\n", program);
     puts("  -p/-i enable the strict ARP/IKE TAP control-packet boundary");
     puts("  -k also punts kernel signalling ESP (temporary transition only)");
     puts("  -t enables clear-GRE test mode; without it user traffic is dropped");
     puts("  -e enables fail-closed DPDK software IPsec (AES-CBC/SHA1-96)");
+    puts("  -d prints opt-in directional cycle diagnostics every five seconds");
 }
 
 static int
-parse_args(int argc, char **argv, struct n3iwf_dp_state *state)
+parse_args(int argc, char **argv, struct n3iwf_up_state *state)
 {
     int option;
 
     optind = 1;
-    while ((option = getopt(argc, argv, "c:s:a:p:i:kteh")) != -1) {
+    while ((option = getopt(argc, argv, "c:s:a:p:i:ktedh")) != -1) {
         switch (option) {
         case 'c':
-            if (strlen(optarg) >= sizeof(state->control_socket)) {
+            if (strlen(optarg) >= sizeof(state->control_name)) {
                 return -1;
             }
-            strcpy(state->control_socket, optarg);
+            strcpy(state->control_name, optarg);
             break;
         case 's':
             state->upf_service_id = (uint16_t)strtoul(optarg, NULL, 10);
@@ -119,6 +131,9 @@ parse_args(int argc, char **argv, struct n3iwf_dp_state *state)
         case 'e':
             state->software_ipsec = true;
             break;
+        case 'd':
+            state->cycle_profile_enabled = true;
+            break;
         case 'h':
         default:
             usage(argv[0]);
@@ -135,7 +150,7 @@ parse_args(int argc, char **argv, struct n3iwf_dp_state *state)
 }
 
 static int
-punt_packet_to_cp(struct rte_mbuf *packet, struct n3iwf_dp_state *state)
+punt_packet_to_cp(struct rte_mbuf *packet, struct n3iwf_up_state *state)
 {
     uint8_t frame[CONTROL_FRAME_CAPACITY];
     const uint8_t *data;
@@ -143,7 +158,7 @@ punt_packet_to_cp(struct rte_mbuf *packet, struct n3iwf_dp_state *state)
     int kind;
 
     if (!state->punt_enabled || packet->port != state->access_port) {
-        return N3IWF_DP_PUNT_NONE;
+        return N3IWF_UP_PUNT_NONE;
     }
     if (length > sizeof(frame)) {
         ++state->stats.control_punt_drops;
@@ -154,11 +169,11 @@ punt_packet_to_cp(struct rte_mbuf *packet, struct n3iwf_dp_state *state)
         ++state->stats.control_punt_drops;
         return -EMSGSIZE;
     }
-    kind = n3iwf_dp_punt_classify_to_cp(
+    kind = n3iwf_up_punt_classify_to_cp(
         data, length, state->punt.local_ipv4_be,
         state->allow_kernel_signalling_esp);
-    if (kind > N3IWF_DP_PUNT_NONE) {
-        if (n3iwf_dp_punt_write(&state->punt, data, length) ==
+    if (kind > N3IWF_UP_PUNT_NONE) {
+        if (n3iwf_up_punt_write(&state->punt, data, length) ==
             (ssize_t)length) {
             ++state->stats.control_to_cp;
         } else {
@@ -177,14 +192,16 @@ static int
 packet_handler(struct rte_mbuf *packet, struct onvm_pkt_meta *meta,
                struct onvm_nf_local_ctx *local_context)
 {
-    struct n3iwf_dp_state *state = local_context->nf->data;
+    struct n3iwf_up_state *state = local_context->nf->data;
     int ipsec_result;
 
     meta->action = ONVM_NF_ACTION_DROP;
     if (state->software_ipsec) {
-        ipsec_result = n3iwf_dp_handle_ipsec_packet(
+        ipsec_result = n3iwf_up_handle_ipsec_packet(
             packet, meta, &state->sessions, &state->child_sas,
-            &state->ipsec, &state->stats, state->upf_service_id,
+            &state->ipsec, &state->stats,
+            state->cycle_profile_enabled ? &state->cycle_profile : NULL,
+            state->upf_service_id,
             state->access_port, state->access_mac);
         if (ipsec_result != -EPROTONOSUPPORT && ipsec_result != -ENOENT) {
             return 0;
@@ -221,7 +238,7 @@ packet_handler(struct rte_mbuf *packet, struct onvm_pkt_meta *meta,
                 return 0;
             }
         }
-        if (punt_packet_to_cp(packet, state) != N3IWF_DP_PUNT_NONE) {
+        if (punt_packet_to_cp(packet, state) != N3IWF_UP_PUNT_NONE) {
             return 0;
         }
         if (ipsec_result == -ENOENT) {
@@ -230,7 +247,7 @@ packet_handler(struct rte_mbuf *packet, struct onvm_pkt_meta *meta,
         ++state->stats.crypto_failures;
         return 0;
     }
-    if (punt_packet_to_cp(packet, state) != N3IWF_DP_PUNT_NONE) {
+    if (punt_packet_to_cp(packet, state) != N3IWF_UP_PUNT_NONE) {
         return 0;
     }
     if (!state->cleartext_test) {
@@ -238,7 +255,7 @@ packet_handler(struct rte_mbuf *packet, struct onvm_pkt_meta *meta,
         ++state->stats.crypto_failures;
         return 0;
     }
-    (void)n3iwf_dp_handle_clear_packet(packet, meta, &state->sessions,
+    (void)n3iwf_up_handle_clear_packet(packet, meta, &state->sessions,
                                        &state->stats, state->upf_service_id,
                                        state->access_port, state->access_mac);
     return 0;
@@ -246,7 +263,7 @@ packet_handler(struct rte_mbuf *packet, struct onvm_pkt_meta *meta,
 
 static void
 return_control_packets(struct onvm_nf_local_ctx *local_context,
-                       struct n3iwf_dp_state *state)
+                       struct n3iwf_up_state *state)
 {
     uint8_t frame[CONTROL_FRAME_CAPACITY];
     unsigned int count;
@@ -258,7 +275,7 @@ return_control_packets(struct onvm_nf_local_ctx *local_context,
         struct rte_mbuf *packet;
         struct onvm_pkt_meta *meta;
         void *data;
-        ssize_t length = n3iwf_dp_punt_read(&state->punt, frame,
+        ssize_t length = n3iwf_up_punt_read(&state->punt, frame,
                                              sizeof(frame));
         int kind;
 
@@ -271,10 +288,10 @@ return_control_packets(struct onvm_nf_local_ctx *local_context,
             }
             break;
         }
-        kind = n3iwf_dp_punt_classify_from_cp(
+        kind = n3iwf_up_punt_classify_from_cp(
             frame, (size_t)length, state->punt.local_ipv4_be,
             state->allow_kernel_signalling_esp);
-        if (kind <= N3IWF_DP_PUNT_NONE) {
+        if (kind <= N3IWF_UP_PUNT_NONE) {
             ++state->stats.control_punt_drops;
             if (kind == -EOPNOTSUPP) {
                 ++state->stats.fragment_drops;
@@ -307,7 +324,7 @@ return_control_packets(struct onvm_nf_local_ctx *local_context,
 
 static bool
 resolve_access_gateway_mac(const char *ifname, const char *own_ipv4,
-                           uint8_t mac_out[N3IWF_DP_ETHER_ADDR_LEN])
+                           uint8_t mac_out[N3IWF_UP_ETHER_ADDR_LEN])
 {
     char line[256];
     char prefix[INET_ADDRSTRLEN];
@@ -354,7 +371,7 @@ resolve_access_gateway_mac(const char *ifname, const char *own_ipv4,
                    &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != 6) {
             continue;
         }
-        for (int i = 0; i < N3IWF_DP_ETHER_ADDR_LEN; ++i) {
+        for (int i = 0; i < N3IWF_UP_ETHER_ADDR_LEN; ++i) {
             mac_out[i] = (uint8_t)m[i];
         }
         found = true;
@@ -365,11 +382,11 @@ resolve_access_gateway_mac(const char *ifname, const char *own_ipv4,
 }
 
 static void
-reconcile_access_macs(struct n3iwf_dp_state *state)
+reconcile_access_macs(struct n3iwf_up_state *state)
 {
     static time_t last_scan;
     time_t now;
-    uint8_t mac[N3IWF_DP_ETHER_ADDR_LEN];
+    uint8_t mac[N3IWF_UP_ETHER_ADDR_LEN];
     bool resolved = false, have_mac = false;
     size_t i;
 
@@ -382,8 +399,8 @@ reconcile_access_macs(struct n3iwf_dp_state *state)
     }
     last_scan = now;
 
-    for (i = 0; i < N3IWF_DP_MAX_SESSIONS; ++i) {
-        struct n3iwf_dp_session *session = &state->sessions.entries[i];
+    for (i = 0; i < N3IWF_UP_MAX_SESSIONS; ++i) {
+        struct n3iwf_up_session *session = &state->sessions.entries[i];
 
         if (!session->used || session->ue_access_mac_valid) {
             continue;
@@ -396,23 +413,99 @@ reconcile_access_macs(struct n3iwf_dp_state *state)
         if (!have_mac) {
             break;
         }
-        if (n3iwf_dp_session_learn_access_mac(session, mac) ==
-            N3IWF_DP_MAC_LEARNED) {
+        if (n3iwf_up_session_learn_access_mac(session, mac) ==
+            N3IWF_UP_MAC_LEARNED) {
             ++state->stats.access_mac_learns;
         }
     }
+
+static void
+print_cycle_profile_direction(
+    const char *direction,
+    const struct n3iwf_up_cycle_profile_direction *current,
+    const struct n3iwf_up_cycle_profile_direction *previous)
+{
+    struct n3iwf_up_cycle_profile_direction window = {
+        .packets = current->packets - previous->packets,
+        .pre_crypto_cycles =
+            current->pre_crypto_cycles - previous->pre_crypto_cycles,
+        .header_transform_cycles =
+            current->header_transform_cycles -
+                previous->header_transform_cycles,
+        .crypto_prepare_cycles =
+            current->crypto_prepare_cycles - previous->crypto_prepare_cycles,
+        .crypto_process_cycles =
+            current->crypto_process_cycles - previous->crypto_process_cycles,
+        .crypto_post_cycles =
+            current->crypto_post_cycles - previous->crypto_post_cycles,
+    };
+    uint64_t total;
+
+    if (window.packets == 0) {
+        return;
+    }
+    total = window.pre_crypto_cycles + window.header_transform_cycles +
+            window.crypto_prepare_cycles + window.crypto_process_cycles +
+            window.crypto_post_cycles;
+    printf("N3IWF-UP cycle-profile direction=%s window_packets=%" PRIu64
+           " avg_pre_crypto=%" PRIu64
+           " avg_header_transform=%" PRIu64
+           " avg_crypto_prepare=%" PRIu64
+           " avg_crypto_process=%" PRIu64
+           " avg_crypto_post=%" PRIu64
+           " avg_total=%" PRIu64 "\n",
+           direction, window.packets,
+           window.pre_crypto_cycles / window.packets,
+           window.header_transform_cycles / window.packets,
+           window.crypto_prepare_cycles / window.packets,
+           window.crypto_process_cycles / window.packets,
+           window.crypto_post_cycles / window.packets,
+           total / window.packets);
+    fflush(stdout);
+}
+
+static void
+print_cycle_profile(struct n3iwf_up_state *state)
+{
+    print_cycle_profile_direction(
+        "ul", &state->cycle_profile.uplink,
+        &state->last_cycle_profile.uplink);
+    print_cycle_profile_direction(
+        "dl", &state->cycle_profile.downlink,
+        &state->last_cycle_profile.downlink);
+    state->last_cycle_profile = state->cycle_profile;
 }
 
 static int
 periodic_action(struct onvm_nf_local_ctx *local_context)
 {
-    struct n3iwf_dp_state *state = local_context->nf->data;
+    struct n3iwf_up_state *state = local_context->nf->data;
+    uint64_t now = rte_get_timer_cycles();
 
-    (void)n3iwf_dp_control_poll(&state->control);
+    /* Shared-memory commands are cheap to check at every burst boundary and
+     * stay serialized with packet processing on this lcore. */
+    (void)n3iwf_up_control_poll(&state->control);
     if (state->software_ipsec) {
-        n3iwf_dp_ipsec_reconcile(&state->ipsec, &state->child_sas);
+        n3iwf_up_ipsec_reconcile(&state->ipsec, &state->child_sas);
     }
     reconcile_access_macs(state);
+
+    /* onvm_nflib invokes user_actions on every busy-loop iteration.  The
+     * TAP is nonblocking, but polling it every iteration
+     * still enters the kernel on an empty dataplane loop.  Bound
+     * that auxiliary work without adding sleeps to packet processing. */
+    if (now - state->last_aux_poll_cycles <
+        state->aux_poll_interval_cycles) {
+        return 0;
+    }
+    state->last_aux_poll_cycles = now;
+    if (state->cycle_profile_enabled &&
+        now - state->last_profile_report_cycles >=
+            state->profile_report_interval_cycles) {
+        print_cycle_profile(state);
+        state->last_profile_report_cycles = now;
+    }
+
     return_control_packets(local_context, state);
     return 0;
 }
@@ -422,7 +515,7 @@ main(int argc, char **argv)
 {
     struct onvm_nf_local_ctx *local_context;
     struct onvm_nf_function_table *functions;
-    struct n3iwf_dp_state *state;
+    struct n3iwf_up_state *state;
     int argument_offset;
 
     local_context = onvm_nflib_init_nf_local_ctx();
@@ -447,16 +540,24 @@ main(int argc, char **argv)
     local_context->nf->dynfield_offset =
         onvm_nflib_get_onvm_config()->dynfield_offset;
 
-    state = rte_zmalloc("n3iwf_dp_state", sizeof(*state), RTE_CACHE_LINE_SIZE);
+    state = rte_zmalloc("n3iwf_up_state", sizeof(*state), RTE_CACHE_LINE_SIZE);
     if (state == NULL) {
-        rte_exit(EXIT_FAILURE, "N3IWF-DP state allocation failed\n");
+        rte_exit(EXIT_FAILURE, "N3IWF-UP state allocation failed\n");
     }
     state->upf_service_id = DEFAULT_UPF_SERVICE_ID;
     state->access_port = DEFAULT_ACCESS_PORT;
     state->punt.fd = -1;
-    strcpy(state->control_socket, DEFAULT_CONTROL_SOCKET);
-    n3iwf_dp_session_table_init(&state->sessions);
-    n3iwf_dp_child_sa_table_init(&state->child_sas);
+    state->aux_poll_interval_cycles =
+        rte_get_timer_hz() * AUX_POLL_INTERVAL_US / 1000000U;
+    if (state->aux_poll_interval_cycles == 0) {
+        state->aux_poll_interval_cycles = 1;
+    }
+    state->profile_report_interval_cycles =
+        rte_get_timer_hz() * PROFILE_REPORT_INTERVAL_SECONDS;
+    state->last_profile_report_cycles = rte_get_timer_cycles();
+    strcpy(state->control_name, DEFAULT_CONTROL_NAME);
+    n3iwf_up_session_table_init(&state->sessions);
+    n3iwf_up_child_sa_table_init(&state->child_sas);
     local_context->nf->data = state;
 
     if (parse_args(argc, argv, state) != 0) {
@@ -477,18 +578,18 @@ main(int argc, char **argv)
         memcpy(state->access_mac, access_mac.addr_bytes,
                sizeof(state->access_mac));
     }
-    if (state->software_ipsec && n3iwf_dp_ipsec_init(&state->ipsec) != 0) {
+    if (state->software_ipsec && n3iwf_up_ipsec_init(&state->ipsec) != 0) {
         rte_exit(EXIT_FAILURE,
                  "No software cryptodev supports AES-CBC-128/256 with HMAC-SHA1-96\n");
     }
-    if (n3iwf_dp_control_open(&state->control, state->control_socket,
+    if (n3iwf_up_control_open(&state->control, state->control_name,
                               &state->sessions, &state->child_sas,
                               &state->stats) != 0) {
-        rte_exit(EXIT_FAILURE, "Cannot open N3IWF-DP control socket %s\n",
-                 state->control_socket);
+        rte_exit(EXIT_FAILURE, "Cannot open N3IWF-UP shared-memory control %s\n",
+                 state->control_name);
     }
     if (state->punt_ifname[0] != '\0') {
-        int punt_result = n3iwf_dp_punt_open(&state->punt,
+        int punt_result = n3iwf_up_punt_open(&state->punt,
                                              state->punt_ifname,
                                              state->nwu_ipv4);
 
@@ -503,21 +604,29 @@ main(int argc, char **argv)
         state->punt_enabled = true;
     }
 
-    printf("N3IWF-DP control=%s upf_service=%u access_port=%u mode=%s "
-           "cp_tap=%s kernel_signalling_esp=%s access_mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
-           state->control_socket, state->upf_service_id, state->access_port,
+    printf("N3IWF-UP control-shm=%s upf_service=%u access_port=%u mode=%s "
+           "cp_tap=%s kernel_signalling_esp=%s aux_poll_us=%u "
+           "access_mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+           state->control_name, state->upf_service_id, state->access_port,
            state->cleartext_test ? "cleartext-test" :
            (state->software_ipsec ? "software-ipsec" : "fail-closed"),
            state->punt_enabled ? state->punt.ifname : "disabled",
            state->allow_kernel_signalling_esp ? "enabled" : "disabled",
+           AUX_POLL_INTERVAL_US,
            state->access_mac[0], state->access_mac[1], state->access_mac[2],
            state->access_mac[3], state->access_mac[4], state->access_mac[5]);
+    if (state->cycle_profile_enabled) {
+        puts("N3IWF-UP cycle profiling enabled (diagnostic results only)");
+    }
     onvm_nflib_run(local_context);
+    if (state->cycle_profile_enabled) {
+        print_cycle_profile(state);
+    }
 
-    n3iwf_dp_control_close(&state->control);
-    n3iwf_dp_ipsec_close(&state->ipsec);
-    n3iwf_dp_child_sa_table_clear(&state->child_sas);
-    n3iwf_dp_punt_close(&state->punt);
+    n3iwf_up_control_close(&state->control);
+    n3iwf_up_ipsec_close(&state->ipsec);
+    n3iwf_up_child_sa_table_clear(&state->child_sas);
+    n3iwf_up_punt_close(&state->punt);
     rte_free(state);
     local_context->nf->data = NULL;
     onvm_nflib_stop(local_context);

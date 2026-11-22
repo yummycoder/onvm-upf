@@ -5,7 +5,7 @@ info:
 configuration:
   log_level: "warning"
   dataplane:
-    # Same-server N3IWF test: N3 is logical over ONVM rings.
+    # Logical N3 carried over the N3IWF-UP/UPF-U ONVM ring.
     upf_n3_ip: "192.168.4.2"
     upf_n6_ip: "192.168.50.1"
 
