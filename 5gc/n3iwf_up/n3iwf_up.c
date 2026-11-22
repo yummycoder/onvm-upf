@@ -418,6 +418,7 @@ reconcile_access_macs(struct n3iwf_up_state *state)
             ++state->stats.access_mac_learns;
         }
     }
+}
 
 static void
 print_cycle_profile_direction(
